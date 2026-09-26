@@ -5,9 +5,15 @@ Checks against the REAL API:
   1. GET  /healthz                         -> 200 status=ok
   2. GET  /                                -> page HTML
   3. POST /api/demo + POST /api/verify     -> shared-prefix two-key change passes,
-                                              BOTH recomputed roots match
+                                              BOTH recomputed roots match, and the
+                                              demo's overlapping prefix permits get
+                                              the stable lex-min allocation
   4. tampered sibling digest               -> ok=false, old_root_mismatch
-  5. extra proof node (off path)           -> ok=false, extra_proof_node
+  5. extra proof node (off path) -> ok=false, extra_proof_node
+  6. legacy request without permits -> accepted, no allocation field
+  7. insufficient permit capacity  -> ok=false, permit_capacity
+  8. key outside every permit      -> ok=false, permit_key_uncovered
+  9. duplicate permit id           -> ok=false, permit_duplicate_id
 
 Usage: http_smoke.py [base_url]   (default http://127.0.0.1:${PORT:-8080})
 Exits 0 only when every assertion holds.
@@ -91,6 +97,8 @@ def main() -> int:
         check("demo payload generated",
               demo.get("ok") and len(demo["payload"]["leaves"]) == 2
               and demo["payload"]["leaves"][0]["key"] < demo["payload"]["leaves"][1]["key"])
+        check("demo payload carries overlapping prefix permits",
+              len(demo["payload"].get("permits", [])) == 2)
 
         payload = demo["payload"]
         first_id = None
@@ -108,6 +116,19 @@ def main() -> int:
                        "old_parent", "new_parent"} <= set(m) for m in ok["merges"]))
             check("  default ladder exposed (257 entries)",
                   len(ok["default_ladder"]) == 257)
+            alloc = ok.get("permit_allocation") or {}
+            usage = {p["permit_id"]: p for p in alloc.get("permits", [])}
+            check("  permit allocation present, one row per changed key",
+                  [a["key"] for a in alloc.get("assignments", [])]
+                  == ok["changed_keys"])
+            check("  overlapping permits -> stable lex-min witness",
+                  [a["permit_id"] for a in alloc.get("assignments", [])]
+                  == ["PERMIT-WIDE", "PERMIT-LEAF-B"])
+            check("  wider permit exhausted while narrower still available",
+                  usage.get("PERMIT-WIDE", {}).get("used") == 1
+                  and usage["PERMIT-WIDE"]["unused"] == 0
+                  and usage.get("PERMIT-LEAF-B", {}).get("used") == 1
+                  and usage["PERMIT-LEAF-B"]["unused"] == 1)
             first_id = ok["verification_id"]
 
         # A failed submission must be rejected on its own merits and identified
@@ -130,6 +151,47 @@ def main() -> int:
         check("extra proof node REJECTED (extra_proof_node)",
               bad2.get("ok") is False and bad2["error"]["code"] == "extra_proof_node",
               json.dumps(bad2, ensure_ascii=False)[:300])
+
+        # A legacy request without permits must keep the legacy response shape.
+        legacy = {k: v for k, v in payload.items() if k != "permits"}
+        ok_legacy = post(base, "/api/verify", legacy)
+        check("request without permits ACCEPTED, response has no allocation field",
+              ok_legacy.get("ok") is True and "permit_allocation" not in ok_legacy,
+              json.dumps(ok_legacy, ensure_ascii=False)[:300])
+
+        # Total permit capacity below the changed-key count must be rejected.
+        insufficient = json.loads(json.dumps(payload))
+        insufficient["permits"] = [
+            p for p in insufficient["permits"] if p["permit_id"] == "PERMIT-WIDE"
+        ]
+        bad3 = post(base, "/api/verify", insufficient)
+        check("insufficient permit capacity REJECTED (permit_capacity)",
+              bad3.get("ok") is False and bad3["error"]["code"] == "permit_capacity",
+              json.dumps(bad3, ensure_ascii=False)[:300])
+        check("  capacity rejection id differs from prior success id",
+              bad3.get("verification_id") != first_id)
+
+        # A changed key outside every permit prefix must be located/rejected.
+        uncovered = json.loads(json.dumps(payload))
+        key_a = uncovered["leaves"][0]["key"]
+        bits_a = "".join(f"{int(c, 16):04b}" for c in key_a)
+        uncovered["permits"] = [
+            {"permit_id": "ONLY-A", "prefix": "0b" + bits_a, "max_keys": 5}
+        ]
+        bad4 = post(base, "/api/verify", uncovered)
+        check("key without candidate permit REJECTED (permit_key_uncovered)",
+              bad4.get("ok") is False
+              and bad4["error"]["code"] == "permit_key_uncovered",
+              json.dumps(bad4, ensure_ascii=False)[:300])
+
+        # Duplicate permit ids must be located/rejected.
+        dup = json.loads(json.dumps(payload))
+        dup["permits"].append(dict(dup["permits"][0]))
+        bad5 = post(base, "/api/verify", dup)
+        check("duplicate permit id REJECTED (permit_duplicate_id)",
+              bad5.get("ok") is False
+              and bad5["error"]["code"] == "permit_duplicate_id",
+              json.dumps(bad5, ensure_ascii=False)[:300])
 
     finally:
         if proc is not None:

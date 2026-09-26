@@ -53,10 +53,22 @@
           placeholder='[&#10;  {"depth": 256, "prefix": "0b…256 bits…", "digest": "<64 hex>"}&#10;]'></textarea>
       </label>
 
+      <label>前缀许可（可选，JSON 数组；每项：唯一 permit_id + 0/1 prefix + 可覆盖最多变更键数 max_keys）
+        <textarea id="permits" rows="5" spellcheck="false"
+          placeholder='[&#10;  {"permit_id": "PERMIT-WIDE", "prefix": "0b…0/1 前缀…", "max_keys": 1}&#10;]'></textarea>
+      </label>
+      <p class="hint">
+        填写许可后：双根复算通过才会进入容量分配，每个变更键必须各占用一次许可额度；
+        嵌套/重叠许可不按输入顺序贪心，系统在全部可行分配中取「按键路径升序的许可标识序列」
+        字典序最小的唯一见证，并返回逐键命中前缀与各许可已用/未用额度。留空则按原有方式核验，
+        请求与响应完全兼容。把额度总和调到小于变更键数、或让某键落在所有前缀之外，
+        可观察真实接口的容量/未覆盖拒绝。
+      </p>
+
       <details class="paste-all">
         <summary>也可以直接粘贴完整 JSON（展开后将整体解析填入）</summary>
         <textarea id="paste-all" rows="8" spellcheck="false"
-          placeholder='{"old_root": "...", "new_root": "...", "leaves": [...], "shared_siblings": [...]}'></textarea>
+          placeholder='{"old_root": "...", "new_root": "...", "leaves": [...], "shared_siblings": [...], "permits": [...]}'></textarea>
         <button type="button" id="parse-all" class="btn btn-ghost">解析并填入上方字段</button>
       </details>
 

@@ -58,7 +58,7 @@ fi
 green "PHASE 1 PASSED"
 
 # --------------------------------------------------------------------------- #
-hdr "PHASE 2/3: CODE TESTS (shared-prefix dual key / tampered sibling / extra node)"
+hdr "PHASE 2/3: CODE TESTS (shared-prefix dual key / tampered sibling / extra node / prefix permits)"
 "$PY" -m unittest discover -s "$TEST_DIR" -p 'test_*.py' -v
 green "PHASE 2 PASSED"
 

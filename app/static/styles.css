@@ -157,6 +157,7 @@ td.hash, th.hash { max-width: 230px; overflow: hidden; text-overflow: ellipsis; 
 .pill-shared-proof { color: var(--warn); }
 .pill-default { color: var(--muted); }
 .pill-changed { color: #8be9c8; }
+.pill-permit { color: #8be9c8; }
 
 .scrollx { overflow-x: auto; max-height: 460px; border: 1px solid var(--line); border-radius: 10px; }
 .kvlist { font-family: var(--mono); font-size: 12px; color: var(--muted); }

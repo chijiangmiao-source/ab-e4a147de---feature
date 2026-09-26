@@ -20,9 +20,11 @@ from smt import (  # noqa: E402
     DEPTH,
     ProofError,
     build_tree,
+    key_to_path,
     leaf_hash,
     node_hash,
     proof_for_changes,
+    result_dict,
     verify_batch,
     sha256,
 )
@@ -291,6 +293,234 @@ class TraceStructureTests(unittest.TestCase):
                                    bytes.fromhex(m["new_right"])).hex()
             self.assertEqual(m["old_parent"], expect_old)
             self.assertEqual(m["new_parent"], expect_new)
+
+
+class PermitTests(unittest.TestCase):
+    """Prefix-permit capacity authorization layered on the dual rebuild."""
+
+    def setUp(self):
+        self.old = {KEY_A0: v(b"A@1"), KEY_A1: v(b"B@1"), KEY_B: v(b"C@1")}
+        self.payload = make_change(
+            self.old, {KEY_A0: v(b"A@2"), KEY_A1: v(b"B@2")}, [KEY_A0, KEY_A1]
+        )
+        self.bits_a0 = key_to_path(KEY_A0)[1]
+        self.bits_a1 = key_to_path(KEY_A1)[1]
+        # The two changed keys differ only in the last bit.
+        self.shared = self.bits_a0[:255]
+        self.assertTrue(self.bits_a1.startswith(self.shared))
+
+    @staticmethod
+    def permit(pid, prefix_bits, cap):
+        return {"permit_id": pid, "prefix": "0b" + prefix_bits, "max_keys": cap}
+
+    def with_permits(self, permits):
+        return {**self.payload, "permits": permits}
+
+    def assertReject(self, payload, code):
+        with self.assertRaises(ProofError) as cm:
+            verify_batch(payload)
+        self.assertEqual(cm.exception.code, code, cm.exception.message)
+        return cm.exception
+
+    def demo_permits(self):
+        # Wide permit covers both keys with a single slot; the narrow one
+        # covers only KEY_A1 with room to spare.
+        return [
+            self.permit("PERMIT-WIDE", self.shared, 1),
+            self.permit("PERMIT-LEAF-B", self.bits_a1, 2),
+        ]
+
+    # -- backward compatibility ------------------------------------------- #
+    def test_permits_absent_is_backward_compatible(self):
+        r = verify_batch(self.payload)
+        self.assertIsNone(r.permit_allocation)
+        d = result_dict(r, "vid")
+        self.assertNotIn("permit_allocation", d)
+        self.assertEqual(r.changed_keys, [KEY_A0, KEY_A1])
+
+    def test_permits_empty_or_null_is_backward_compatible(self):
+        for value in ([], None):
+            r = verify_batch({**self.payload, "permits": value})
+            self.assertIsNone(r.permit_allocation)
+            self.assertNotIn("permit_allocation", result_dict(r, "vid"))
+
+    # -- stable allocation over overlapping permits ------------------------ #
+    def test_overlapping_permits_stable_allocation(self):
+        r = verify_batch(self.with_permits(self.demo_permits()))
+        alloc = r.permit_allocation
+        self.assertEqual(
+            [(a["key"], a["permit_id"]) for a in alloc["assignments"]],
+            [(KEY_A0, "PERMIT-WIDE"), (KEY_A1, "PERMIT-LEAF-B")],
+        )
+        # Per-key matched prefix is reported.
+        self.assertEqual(alloc["assignments"][0]["permit_prefix"],
+                         "0b" + self.shared)
+        self.assertEqual(alloc["assignments"][1]["permit_prefix"],
+                         "0b" + self.bits_a1)
+
+    def test_wider_exhausted_narrower_available_still_passes(self):
+        r = verify_batch(self.with_permits(self.demo_permits()))
+        usage = {p["permit_id"]: p for p in r.permit_allocation["permits"]}
+        # Wider permit fully consumed, narrower one still has spare quota.
+        self.assertEqual((usage["PERMIT-WIDE"]["used"],
+                          usage["PERMIT-WIDE"]["unused"]), (1, 0))
+        self.assertEqual((usage["PERMIT-LEAF-B"]["used"],
+                          usage["PERMIT-LEAF-B"]["unused"]), (1, 1))
+
+    def test_allocation_independent_of_permit_input_order(self):
+        forward = verify_batch(self.with_permits(self.demo_permits()))
+        backward = verify_batch(
+            self.with_permits(list(reversed(self.demo_permits())))
+        )
+        self.assertEqual(forward.permit_allocation["assignments"],
+                         backward.permit_allocation["assignments"])
+
+    def test_lex_min_beats_input_order_greedy(self):
+        # Both permits cover both keys; input order puts ZULU first, but the
+        # lexicographically smallest id sequence must win.
+        permits = [self.permit("ZULU", "", 1), self.permit("ALPHA", "", 1)]
+        r = verify_batch(self.with_permits(permits))
+        self.assertEqual(
+            [a["permit_id"] for a in r.permit_allocation["assignments"]],
+            ["ALPHA", "ZULU"],
+        )
+        r2 = verify_batch(self.with_permits(list(reversed(permits))))
+        self.assertEqual(
+            [a["permit_id"] for a in r2.permit_allocation["assignments"]],
+            ["ALPHA", "ZULU"],
+        )
+
+    def test_lex_min_unique_witness(self):
+        # Multiple feasible assignments exist; the witness is the unique
+        # lex-min one: both keys land on ALPHA, BETA stays unused.
+        permits = [self.permit("BETA", "", 2), self.permit("ALPHA", "", 2)]
+        r = verify_batch(self.with_permits(permits))
+        alloc = r.permit_allocation
+        self.assertEqual([a["permit_id"] for a in alloc["assignments"]],
+                         ["ALPHA", "ALPHA"])
+        usage = {p["permit_id"]: p for p in alloc["permits"]}
+        self.assertEqual(usage["ALPHA"]["used"], 2)
+        self.assertEqual(usage["BETA"]["used"], 0)
+
+    def test_narrow_first_wide_absorbs_overflow(self):
+        # Three changed keys; narrow per-key permits are preferred by the
+        # lex-min rule, the wide permit absorbs what is left. Note KEY_C
+        # ("00…0f") sorts before KEY_A0/KEY_A1 ("01…"), so it is served first
+        # and — having no narrow permit — takes the wide one.
+        old = {KEY_A0: v(b"A@1"), KEY_A1: v(b"B@1"), KEY_C: v(b"C@1")}
+        payload = make_change(
+            old,
+            {KEY_A0: v(b"A@2"), KEY_A1: v(b"B@2"), KEY_C: v(b"C@2")},
+            [KEY_A0, KEY_A1, KEY_C],
+        )
+        bits_c = key_to_path(KEY_C)[1]
+        common = self.shared[:7]  # shared by all three keys
+        self.assertTrue(bits_c.startswith(common))
+        permits = [
+            self.permit("P-WIDE", common, 2),
+            self.permit("P-NA", self.bits_a0, 1),
+            self.permit("P-NB", self.bits_a1, 1),
+        ]
+        r = verify_batch({**payload, "permits": permits})
+        alloc = r.permit_allocation
+        self.assertEqual(
+            [(a["key"], a["permit_id"]) for a in alloc["assignments"]],
+            [(KEY_C, "P-WIDE"), (KEY_A0, "P-NA"), (KEY_A1, "P-NB")],
+        )
+        usage = {p["permit_id"]: p for p in alloc["permits"]}
+        self.assertEqual(usage["P-WIDE"]["used"], 1)
+        self.assertEqual(usage["P-WIDE"]["unused"], 1)
+
+    def test_empty_prefix_matches_all_keys(self):
+        r = verify_batch(self.with_permits([self.permit("E", "", 5)]))
+        self.assertEqual([a["permit_id"] for a in
+                          r.permit_allocation["assignments"]], ["E", "E"])
+
+    def test_result_dict_includes_allocation_when_permits_given(self):
+        r = verify_batch(self.with_permits(self.demo_permits()))
+        d = result_dict(r, "vid")
+        self.assertIn("permit_allocation", d)
+        self.assertEqual(len(d["permit_allocation"]["assignments"]), 2)
+        self.assertEqual(len(d["permit_allocation"]["permits"]), 2)
+
+    # -- capacity rejections ------------------------------------------------ #
+    def test_total_capacity_insufficient(self):
+        # One wide permit with a single slot cannot cover two changed keys.
+        err = self.assertReject(
+            self.with_permits([self.permit("W", self.shared, 1)]),
+            "permit_capacity",
+        )
+        self.assertIn("总额度", err.message)
+
+    def test_structural_capacity_insufficient_located(self):
+        # Total quota is enough (3 for 3 keys) but the two low keys can only
+        # use the root permit -> structural shortage located at prefix 1111.
+        old = {KEY_A0: v(b"A@1"), KEY_A1: v(b"B@1"), KEY_D: v(b"D@1")}
+        payload = make_change(
+            old,
+            {KEY_A0: v(b"A@2"), KEY_A1: v(b"B@2"), KEY_D: v(b"D@2")},
+            [KEY_A0, KEY_A1, KEY_D],
+        )
+        permits = [self.permit("ROOT", "", 1), self.permit("HI", "1111", 2)]
+        err = self.assertReject({**payload, "permits": permits},
+                                "permit_capacity")
+        self.assertIn("1111", err.message)
+
+    def test_key_without_candidate_permit(self):
+        permits = [self.permit("ONLY-A", self.bits_a0, 5)]
+        err = self.assertReject(self.with_permits(permits),
+                                "permit_key_uncovered")
+        self.assertIn(KEY_A1, err.message)
+
+    # -- malformed permits -------------------------------------------------- #
+    def test_duplicate_permit_id(self):
+        permits = self.demo_permits()
+        permits.append(dict(permits[0]))
+        err = self.assertReject(self.with_permits(permits),
+                                "permit_duplicate_id")
+        self.assertIn("PERMIT-WIDE", err.message)
+
+    def test_permit_prefix_format_errors(self):
+        for bad in ("0b012", "0b" + "0" * (DEPTH + 1), "xyz"):
+            permits = [self.permit("P", self.shared, 1)]
+            permits[0]["prefix"] = bad
+            self.assertReject(self.with_permits(permits),
+                              "permit_prefix_format")
+        permits = [{"permit_id": "P", "prefix": 123, "max_keys": 1}]
+        self.assertReject(self.with_permits(permits), "permit_prefix_format")
+
+    def test_permit_quota_errors(self):
+        for bad_cap in (0, -3, "2", True, 1.5):
+            permits = [self.permit("P", self.shared, 1)]
+            permits[0]["max_keys"] = bad_cap
+            self.assertReject(self.with_permits(permits), "permit_quota")
+
+    def test_permit_format_errors(self):
+        self.assertReject(self.with_permits("not-a-list"), "permit_format")
+        self.assertReject(self.with_permits([42]), "permit_format")
+        self.assertReject(self.with_permits([{"permit_id": "P"}]),
+                          "permit_format")
+        self.assertReject(
+            self.with_permits([{"permit_id": "  ", "prefix": "0b",
+                                "max_keys": 1}]),
+            "permit_format",
+        )
+
+    # -- ordering: permits only after both roots verify --------------------- #
+    def test_roots_checked_before_permits(self):
+        # Tampered sibling AND duplicate permit ids: the root error must win.
+        p = self.with_permits(self.demo_permits() + [self.demo_permits()[0]])
+        p["shared_siblings"] = [dict(s) for s in p["shared_siblings"]]
+        p["shared_siblings"][0]["digest"] = (b"\x11" * 32).hex()
+        self.assertReject(p, "old_root_mismatch")
+
+    def test_failed_allocation_leaves_no_partial_conclusion(self):
+        # A rejection carries no allocation; a later valid submission is
+        # independent of the failed one.
+        bad = self.with_permits([self.permit("W", self.shared, 1)])
+        self.assertReject(bad, "permit_capacity")
+        good = verify_batch(self.with_permits(self.demo_permits()))
+        self.assertEqual(len(good.permit_allocation["assignments"]), 2)
 
 
 if __name__ == "__main__":

@@ -30,12 +30,16 @@ function esc(s) {
 function collectPayload() {
   const leaves = JSON.parse($("leaves").value || "[]");
   const siblings = JSON.parse($("siblings").value || "[]");
-  return {
+  const payload = {
     old_root: $("old-root").value.trim(),
     new_root: $("new-root").value.trim(),
     leaves,
     shared_siblings: siblings,
   };
+  // Permits are optional: an empty field keeps the legacy request shape.
+  const permitsRaw = $("permits").value.trim();
+  if (permitsRaw) payload.permits = JSON.parse(permitsRaw);
+  return payload;
 }
 
 function fillForm(p) {
@@ -43,6 +47,7 @@ function fillForm(p) {
   $("new-root").value = p.new_root ?? "";
   $("leaves").value = JSON.stringify(p.leaves ?? [], null, 2);
   $("siblings").value = JSON.stringify(p.shared_siblings ?? [], null, 2);
+  $("permits").value = p.permits ? JSON.stringify(p.permits, null, 2) : "";
 }
 
 function showFormError(msg) {
@@ -114,6 +119,34 @@ function renderSuccess(d) {
        </table></div></div></details>`
     : "";
 
+  const alloc = d.permit_allocation || null;
+  const allocHtml = alloc ? `
+    <h3 class="section">前缀许可分配（按键路径升序 · 许可标识序列字典序最小的唯一见证）</h3>
+    <div class="scrollx"><table>
+      <thead><tr><th>变更键 key</th><th>命中许可</th><th>命中前缀</th></tr></thead>
+      <tbody>${alloc.assignments.map((a) => `
+        <tr>
+          <td class="hash" title="${esc(a.key)}">${esc(short(a.key, 12))}</td>
+          <td><span class="pill pill-permit">${esc(a.permit_id)}</span></td>
+          <td class="hash" title="${esc(a.permit_prefix)}">${esc(short(a.permit_prefix, 20))}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table></div>
+    <h3 class="section">许可额度（已用 / 未使用）</h3>
+    <div class="scrollx"><table>
+      <thead><tr><th>permit_id</th><th>prefix</th><th>额度 max_keys</th><th>已用</th><th>未使用</th></tr></thead>
+      <tbody>${alloc.permits.map((p) => `
+        <tr>
+          <td><span class="pill pill-permit">${esc(p.permit_id)}</span></td>
+          <td class="hash" title="${esc(p.prefix)}">${esc(short(p.prefix, 20))}</td>
+          <td>${p.max_keys}</td>
+          <td>${p.used}</td>
+          <td>${p.unused === 0 ? "0（已耗尽）" : p.unused}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table></div>`
+    : "";
+
   $("result-body").innerHTML = `
     <div class="verdict ok">
       <div style="font-size:26px">✓</div>
@@ -122,7 +155,7 @@ function renderSuccess(d) {
         <p>旧树与新树已由同一份叶/兄弟骨架自底向上分别重建，两个复算根均与提交根一致。</p>
         <p class="sub">verification_id = <code>${esc(d.verification_id)}</code> ·
           变更键 ${d.changed_keys.length} 个 ·
-          合并层级 ${d.merges.length} 行 · 无状态结论，刷新或重提即失效</p>
+          合并层级 ${d.merges.length} 行${alloc ? ` · 许可分配 ${alloc.assignments.length} 键` : ""} · 无状态结论，刷新或重提即失效</p>
       </div>
     </div>
 
@@ -150,6 +183,8 @@ function renderSuccess(d) {
       <thead><tr><th>depth</th><th>prefix</th><th>digest（旧/新共用，因子树未变）</th><th>默认空树?</th></tr></thead>
       <tbody>${sibRows}</tbody>
     </table></div>
+
+    ${allocHtml}
 
     <h3 class="section">每层合并轨迹（自底向上 level 255 → 0；内部节点 SHA-256(01 ‖ L ‖ R)）</h3>
     <div class="scrollx"><table>
@@ -236,7 +271,7 @@ $("verify-form").addEventListener("submit", async (ev) => {
     try {
       payload = collectPayload();
     } catch (err) {
-      throw new Error("叶/兄弟 JSON 数组解析失败：" + err.message);
+      throw new Error("叶/兄弟/许可 JSON 数组解析失败：" + err.message);
     }
     const r = await fetch("/api/verify", {
       method: "POST",

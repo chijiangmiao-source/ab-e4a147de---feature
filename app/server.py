@@ -8,6 +8,7 @@ GET  /healthz          liveness/readiness JSON
 POST /api/verify       verify one batch submission (stateless; never caches
                        prior verdicts)
 POST /api/demo         build a valid two-key shared-prefix demo payload
+                       (includes an overlapping prefix-permit set)
 
 Configuration via environment:
   PORT=8080   HOST=0.0.0.0   MAX_BODY_BYTES=1048576
@@ -27,6 +28,7 @@ from smt import (
     DEPTH,
     ProofError,
     build_tree,
+    key_to_path,
     proof_for_changes,
     result_dict,
     sha256,
@@ -54,6 +56,25 @@ def _demo_payload() -> dict:
     old_root = build_tree(old_entries)
     new_root = build_tree(new_entries)
     siblings = proof_for_changes(old_entries, [key_a, key_b])
+
+    # Overlapping prefix permits: the wide permit covers both keys but has
+    # only one slot, the narrow permit covers only key B. The unique
+    # lexicographically smallest assignment is A -> PERMIT-WIDE (1/1,
+    # exhausted) and B -> PERMIT-LEAF-B (1/2, still available) — the batch
+    # passes even though the wider permit is fully consumed. Deleting a
+    # permit or lowering the quotas below the key count shows the
+    # capacity/uncovered rejections on the real API.
+    bits_a = key_to_path(key_a)[1]
+    bits_b = key_to_path(key_b)[1]
+    shared = ""
+    for x, y in zip(bits_a, bits_b):
+        if x != y:
+            break
+        shared += x
+    permits = [
+        {"permit_id": "PERMIT-WIDE", "prefix": "0b" + shared, "max_keys": 1},
+        {"permit_id": "PERMIT-LEAF-B", "prefix": "0b" + bits_b, "max_keys": 2},
+    ]
     return {
         "old_root": old_root.hex(),
         "new_root": new_root.hex(),
@@ -70,6 +91,7 @@ def _demo_payload() -> dict:
             },
         ],
         "shared_siblings": siblings,
+        "permits": permits,
     }
 
 

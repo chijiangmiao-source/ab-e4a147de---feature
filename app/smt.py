@@ -21,6 +21,7 @@ The submitted roots are never used to derive anything.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 from dataclasses import dataclass, field
 
@@ -149,6 +150,7 @@ class VerifyResult:
     merges: list[MergeRow]
     defaults_used: list[dict]
     changed_keys: list[str]
+    permit_allocation: dict | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -214,6 +216,270 @@ def _parse_siblings(raw: object) -> list[Sibling]:
         digest = parse_digest(item["digest"], f"shared_siblings[{i}].digest")
         out.append(Sibling(depth, bits, digest, str(raw_prefix)))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Prefix permits (optional capacity authorization for the changed keys)
+# --------------------------------------------------------------------------- #
+
+MAX_PERMITS = 512
+
+
+@dataclass(frozen=True)
+class Permit:
+    permit_id: str
+    prefix: str   # 0..256 bits; "" matches every key
+    max_keys: int
+    index: int    # submission position, for error messages
+
+
+def _parse_permits(raw: object) -> list[Permit] | None:
+    """Parse the optional permit list.
+
+    Returns ``None`` when the feature is not used (field absent, JSON null or
+    an empty array), so legacy requests keep their legacy behaviour and a
+    response shape identical to the pre-permit service.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ProofError("permits 必须是数组", "permit_format")
+    if not raw:
+        return None
+    if len(raw) > MAX_PERMITS:
+        raise ProofError(f"许可数量超过上限 {MAX_PERMITS}", "too_many_permits")
+
+    permits: list[Permit] = []
+    seen: dict[str, int] = {}
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ProofError(f"permits[{i}] 必须是对象", "permit_format")
+        if not {"permit_id", "prefix", "max_keys"} <= set(item):
+            raise ProofError(
+                f"permits[{i}] 必须包含 permit_id、prefix、max_keys 字段",
+                "permit_format",
+            )
+        pid = item["permit_id"]
+        if not isinstance(pid, str) or not pid.strip():
+            raise ProofError(
+                f"permits[{i}].permit_id 必须是非空字符串", "permit_format"
+            )
+        pid = pid.strip()
+        if len(pid) > 128:
+            raise ProofError(
+                f"许可标识 {pid[:32]!r}… 超过 128 字符上限", "permit_format"
+            )
+        if pid in seen:
+            raise ProofError(
+                f"许可标识重复: {pid!r} 同时出现在 permits[{seen[pid]}] 与 "
+                f"permits[{i}]，许可标识必须唯一",
+                "permit_duplicate_id",
+            )
+        seen[pid] = i
+
+        raw_prefix = item["prefix"]
+        if not isinstance(raw_prefix, str):
+            raise ProofError(
+                f"许可 {pid!r} 的 prefix 必须是 0/1 字符串", "permit_prefix_format"
+            )
+        bits = raw_prefix.strip().removeprefix("0b")
+        if len(bits) > DEPTH or any(c not in _BITS for c in bits):
+            raise ProofError(
+                f"许可 {pid!r} 的前缀 {raw_prefix!r} 非法: 须为 0..256 个 0/1 "
+                "字符（可带 0b 前缀，空前缀表示覆盖全部键）",
+                "permit_prefix_format",
+            )
+
+        cap = item["max_keys"]
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise ProofError(
+                f"许可 {pid!r} 的 max_keys 必须是正整数，实际为 {cap!r}",
+                "permit_quota",
+            )
+        permits.append(Permit(pid, bits, cap, i))
+    return permits
+
+
+def allocate_permits(paths: list[str], keys: list[str],
+                     permits: list[Permit]) -> dict:
+    """Assign every changed key to one prefix-matching permit.
+
+    Each permit may absorb at most ``max_keys`` keys. Nested/overlapping
+    permits are NOT distributed greedily by input order: among all feasible
+    assignments the function returns the unique witness whose permit-id
+    sequence (keys taken in ascending 256-bit path order) is lexicographically
+    smallest. Raises ProofError when a key has no candidate permit or when no
+    assignment can give every key one permit slot.
+    """
+    n = len(paths)  # paths/keys are already in ascending path order
+    m = len(permits)
+
+    # Candidate permits per key, pre-sorted by permit id.
+    candidates: list[list[int]] = []
+    for key, path in zip(keys, paths):
+        cand = [j for j, p in enumerate(permits) if path.startswith(p.prefix)]
+        if not cand:
+            raise ProofError(
+                f"变更键 {key} 不在任何许可前缀范围内：没有候选许可可承接该键",
+                "permit_key_uncovered",
+            )
+        cand.sort(key=lambda j: permits[j].permit_id)
+        candidates.append(cand)
+
+    # Permit key-sets are laminar (prefix-nested), so the keys under any
+    # permit prefix form one contiguous interval of the sorted key list, and
+    # the distinct prefixes form a tree. For such a tree the max-flow/min-cut
+    # (Hall) feasibility condition of any residual instance is
+    #     sum over tree roots r of min(0, h(r)) >= need - total_capacity
+    # where f(t) = keys_under(t) - capacity_under(t) and
+    # h(t) = min(f(t), sum of h over children of t).
+    node_prefix: list[str] = []
+    prefix_to_node: dict[str, int] = {}
+    node_of: list[int] = []
+    for p in permits:
+        nid = prefix_to_node.get(p.prefix)
+        if nid is None:
+            nid = len(node_prefix)
+            prefix_to_node[p.prefix] = nid
+            node_prefix.append(p.prefix)
+        node_of.append(nid)
+    nn = len(node_prefix)
+
+    parent = [-1] * nn
+    for nid, pfx in enumerate(node_prefix):
+        for length in range(len(pfx) - 1, -1, -1):
+            up = prefix_to_node.get(pfx[:length])
+            if up is not None:
+                parent[nid] = up
+                break
+    children: list[list[int]] = [[] for _ in range(nn)]
+    roots: list[int] = []
+    for nid, par in enumerate(parent):
+        if par >= 0:
+            children[par].append(nid)
+        else:
+            roots.append(nid)
+    deepest_first = sorted(range(nn), key=lambda t: -len(node_prefix[t]))
+
+    lo_of = [bisect.bisect_left(paths, pfx) for pfx in node_prefix]
+    hi_of = [bisect.bisect_left(paths, pfx + "2") for pfx in node_prefix]
+
+    def residual_deficit(start: int, remaining: list[int]) -> tuple[int, list[int], list[int]]:
+        """(deficit, keys_under, cap_under) for keys[start:].
+
+        deficit = sum of min(0, h(root)) - (need - total); feasible iff >= 0.
+        """
+        need = n - start
+        total = sum(remaining)
+        keys_under = [0] * nn
+        for t in range(nn):
+            cnt = hi_of[t] - max(lo_of[t], start)
+            keys_under[t] = cnt if cnt > 0 else 0
+        cap_under = [0] * nn
+        for j in range(m):
+            cap_under[node_of[j]] += remaining[j]
+        for t in deepest_first:
+            if parent[t] >= 0:
+                cap_under[parent[t]] += cap_under[t]
+        h = [0] * nn
+        for t in deepest_first:
+            down = sum(h[c] for c in children[t])
+            f = keys_under[t] - cap_under[t]
+            h[t] = f if f < down else down
+        deficit = sum(min(0, h[r]) for r in roots) - (need - total)
+        return deficit, keys_under, cap_under
+
+    def residual_feasible(start: int, remaining: list[int]) -> bool:
+        """Can keys[start:] still be placed with the remaining capacities?"""
+        if n - start > sum(remaining):
+            return False
+        deficit, _, _ = residual_deficit(start, remaining)
+        return deficit >= 0
+
+    remaining = [p.max_keys for p in permits]
+
+    if not residual_feasible(0, remaining):
+        total = sum(remaining)
+        if n > total:
+            raise ProofError(
+                f"许可总额度不足: {n} 个变更键各需占用一次许可额度，"
+                f"全部许可总额度仅 {total}",
+                "permit_capacity",
+            )
+        # Locate the bottleneck: reconstruct the witness antichain of prefix
+        # cones whose outside holds more keys than the outside capacity.
+        _, keys_under, cap_under = residual_deficit(0, remaining)
+        h = [0] * nn
+        for t in deepest_first:
+            down = sum(h[c] for c in children[t])
+            f = keys_under[t] - cap_under[t]
+            h[t] = f if f < down else down
+
+        witness: list[int] = []
+
+        def collect(t: int) -> None:
+            down = sum(h[c] for c in children[t])
+            if keys_under[t] - cap_under[t] <= down:
+                witness.append(t)
+            else:
+                for c in children[t]:
+                    collect(c)
+
+        for r in roots:
+            if h[r] < 0:
+                collect(r)
+        outside_keys = n - sum(keys_under[t] for t in witness)
+        outside_cap = total - sum(cap_under[t] for t in witness)
+        shown = "、".join(f"0b{node_prefix[t]}" for t in witness[:3])
+        if len(witness) > 3:
+            shown += f" 等 {len(witness)} 个"
+        raise ProofError(
+            f"许可容量不足: 落在许可前缀 {shown} 覆盖范围之外的变更键有 "
+            f"{outside_keys} 个，而范围之外的许可总额度仅 {outside_cap}"
+            f"（缺口 {outside_keys - outside_cap}）",
+            "permit_capacity",
+        )
+
+    # Lexicographically smallest witness: for each key in ascending path
+    # order take the smallest permit id that still admits a feasible
+    # completion. The upfront check guarantees one candidate always survives.
+    assigned = [-1] * n
+    for i in range(n):
+        for j in candidates[i]:
+            if remaining[j] <= 0:
+                continue
+            remaining[j] -= 1
+            if residual_feasible(i + 1, remaining):
+                assigned[i] = j
+                break
+            remaining[j] += 1
+        else:  # pragma: no cover - unreachable after the feasibility check
+            raise ProofError(
+                f"许可容量不足: 无法为全部 {n} 个变更键各分配一次许可额度",
+                "permit_capacity",
+            )
+
+    used = [p.max_keys - remaining[j] for j, p in enumerate(permits)]
+    return {
+        "assignments": [
+            {
+                "key": keys[i],
+                "permit_id": permits[a].permit_id,
+                "permit_prefix": "0b" + permits[a].prefix,
+            }
+            for i, a in enumerate(assigned)
+        ],
+        "permits": [
+            {
+                "permit_id": p.permit_id,
+                "prefix": "0b" + p.prefix,
+                "max_keys": p.max_keys,
+                "used": used[j],
+                "unused": p.max_keys - used[j],
+            }
+            for j, p in sorted(enumerate(permits), key=lambda t: t[1].permit_id)
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -388,6 +654,17 @@ def verify_batch(payload: object) -> VerifyResult:
             raise mismatch("旧根", got_old, declared_old, "old_root_mismatch")
         raise mismatch("新根", got_new, declared_new, "new_root_mismatch")
 
+    # ---- Prefix permits (only after BOTH roots verified) ------------------ #
+    # The dual rebuild above is untouched; permit authorization is layered on
+    # top of a cryptographically valid batch. Any permit problem rejects the
+    # batch on its own — no partial/earlier allocation is ever returned.
+    permits = _parse_permits(payload.get("permits"))
+    permit_allocation = None
+    if permits is not None:
+        permit_allocation = allocate_permits(
+            [u.path for u in updates], [u.key for u in updates], permits
+        )
+
     return VerifyResult(
         old_root=declared_old.hex(),
         new_root=declared_new.hex(),
@@ -415,11 +692,12 @@ def verify_batch(payload: object) -> VerifyResult:
         merges=[vars(m) for m in merges],
         defaults_used=defaults_used,
         changed_keys=[u.key for u in updates],
+        permit_allocation=permit_allocation,
     )
 
 
 def result_dict(r: VerifyResult, verification_id: str) -> dict:
-    return {
+    d = {
         "ok": True,
         "verification_id": verification_id,
         "old_root": r.old_root,
@@ -436,6 +714,11 @@ def result_dict(r: VerifyResult, verification_id: str) -> dict:
             for h in range(DEPTH, -1, -1)
         ],
     }
+    # Only present when the submission actually carried permits: legacy
+    # requests keep the legacy response shape, field for field.
+    if r.permit_allocation is not None:
+        d["permit_allocation"] = r.permit_allocation
+    return d
 
 
 # --------------------------------------------------------------------------- #
