@@ -6,8 +6,10 @@ GET  /                 verification page
 GET  /static/*         static assets
 GET  /healthz          liveness/readiness JSON
 POST /api/verify       verify one batch submission (stateless; never caches
-                       prior verdicts)
+                       prior verdicts). Optional "licenses" add prefix-permit
+                       capacity constraints checked only after both roots pass.
 POST /api/demo         build a valid two-key shared-prefix demo payload
+                       (including a nested/overlapping license set)
 
 Configuration via environment:
   PORT=8080   HOST=0.0.0.0   MAX_BODY_BYTES=1048576
@@ -27,6 +29,7 @@ from smt import (
     DEPTH,
     ProofError,
     build_tree,
+    key_to_path,
     proof_for_changes,
     result_dict,
     sha256,
@@ -54,6 +57,7 @@ def _demo_payload() -> dict:
     old_root = build_tree(old_entries)
     new_root = build_tree(new_entries)
     siblings = proof_for_changes(old_entries, [key_a, key_b])
+    shared = key_to_path(key_a)[1][:255]  # the 255 leading bits both keys share
     return {
         "old_root": old_root.hex(),
         "new_root": new_root.hex(),
@@ -70,6 +74,15 @@ def _demo_payload() -> dict:
             },
         ],
         "shared_siblings": siblings,
+        # Nested + overlapping prefix licenses, deliberately listed
+        # widest-first: an input-order greedy would mis-allocate, while the
+        # verifier returns the lexicographically smallest license-id witness
+        # (wide license ends exhausted, the narrow one still has spare quota).
+        "licenses": [
+            {"id": "NEUTRON-LINE-WIDE", "prefix": "0b0", "quota": 1},
+            {"id": "NEUTRON-PAIR-255", "prefix": "0b" + shared, "quota": 1},
+            {"id": "NEUTRON-A0-EXACT", "prefix": "0b" + shared + "0", "quota": 2},
+        ],
     }
 
 

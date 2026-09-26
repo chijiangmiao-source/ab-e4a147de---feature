@@ -17,11 +17,21 @@ touched subtree is unchanged (its root digest is supplied as a shared sibling
 proof) or empty (the default digest)". The verifier rebuilds BOTH trees
 bottom-up from one structural skeleton and compares both recomputed roots.
 The submitted roots are never used to derive anything.
+
+Optionally the submission may carry ``licenses``: prefix permits of the form
+{id, 0/1 prefix, quota}. Only after BOTH roots verify, every changed key is
+matched against all licenses whose prefix covers it, and the batch is
+accepted only if every key can occupy exactly one license slot. Among all
+feasible assignments the verifier returns the unique witness whose license-id
+sequence (keys in ascending path order) is lexicographically smallest —
+never an input-order greedy allocation.
 """
 
 from __future__ import annotations
 
+import bisect
 import hashlib
+import heapq
 from dataclasses import dataclass, field
 
 DEPTH = 256
@@ -123,6 +133,15 @@ class Sibling:
     raw_prefix: str
 
 
+@dataclass(frozen=True)
+class License:
+    id: str          # unique license identifier
+    prefix: str      # 0..256 bits, MSB-first; "" matches every key path
+    quota: int       # max number of change keys this license may cover (>= 1)
+    raw_prefix: str
+    index: int       # submission position inside licenses[]
+
+
 @dataclass
 class MergeRow:
     level: int
@@ -149,6 +168,7 @@ class VerifyResult:
     merges: list[MergeRow]
     defaults_used: list[dict]
     changed_keys: list[str]
+    license_witness: dict | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -214,6 +234,184 @@ def _parse_siblings(raw: object) -> list[Sibling]:
         digest = parse_digest(item["digest"], f"shared_siblings[{i}].digest")
         out.append(Sibling(depth, bits, digest, str(raw_prefix)))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Prefix licenses (optional capacity constraints over the changed keys)
+# --------------------------------------------------------------------------- #
+
+MAX_LICENSES = 256
+
+
+def _parse_licenses(raw: object) -> list[License]:
+    """Validate the optional ``licenses`` array.
+
+    Each entry carries a unique id, a 0/1 prefix (the key-path range it may
+    cover) and a positive quota (the max number of change keys it may cover).
+    Every violation raises a ProofError that pinpoints licenses[i].
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProofError("licenses 必须是数组", "license_format")
+    if len(raw) > MAX_LICENSES:
+        raise ProofError(f"许可数量超过上限 {MAX_LICENSES}", "too_many_licenses")
+
+    out: list[License] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ProofError(f"licenses[{i}] 必须是对象", "license_format")
+        if not {"id", "prefix", "quota"} <= set(item):
+            raise ProofError(
+                f"licenses[{i}] 必须包含 id、prefix、quota 字段", "license_format"
+            )
+        lid = item["id"]
+        if not isinstance(lid, str) or not lid.strip() or len(lid.strip()) > 128:
+            raise ProofError(
+                f"licenses[{i}].id 必须是 1..128 字符的非空字符串: {lid!r}",
+                "license_id_format",
+            )
+        lid = lid.strip()
+        raw_prefix = item["prefix"]
+        if not isinstance(raw_prefix, str):
+            raise ProofError(
+                f"licenses[{i}].prefix 必须是 0/1 字符串: {raw_prefix!r}",
+                "license_prefix_format",
+            )
+        bits = raw_prefix.strip().removeprefix("0b")
+        if len(bits) > DEPTH or any(c not in _BITS for c in bits):
+            raise ProofError(
+                f"licenses[{i}].prefix 必须是 0..256 个 0/1（可带 0b 前缀），"
+                f"实际为 {raw_prefix!r}",
+                "license_prefix_format",
+            )
+        quota = item["quota"]
+        if isinstance(quota, bool) or not isinstance(quota, int) or quota < 1:
+            raise ProofError(
+                f"licenses[{i}].quota={quota!r} 不是正整数额度："
+                "可覆盖的最多变更键数必须 ≥ 1",
+                "license_quota",
+            )
+        out.append(License(lid, bits, quota, str(raw_prefix), i))
+
+    seen: dict[str, int] = {}
+    for lic in out:
+        if lic.id in seen:
+            raise ProofError(
+                f"许可标识重复: {lic.id!r} 同时出现在 "
+                f"licenses[{seen[lic.id]}] 与 licenses[{lic.index}]",
+                "duplicate_license_id",
+            )
+        seen[lic.id] = lic.index
+    return out
+
+
+def _assign_licenses(
+    keys: list[str], paths: list[str], licenses: list[License]
+) -> list[int]:
+    """Assign every changed key to one prefix-matching license slot.
+
+    Nested/overlapping licenses are NOT handed out greedily in input order:
+    the returned witness is, among ALL feasible capacity-respecting
+    assignments, the unique one whose license-id sequence (keys taken in
+    ascending path order) is lexicographically smallest. Raises ProofError
+    locating the cause when a key has no candidate license or the capacity
+    constraints cannot seat every key exactly once.
+    """
+    n = len(paths)
+    m = len(licenses)
+
+    # Keys are sorted, so each license prefix covers a contiguous interval
+    # [lo, hi) of key indices ("2" sorts after every '0'/'1' suffix, making
+    # [prefix, prefix+"2") exactly the paths carrying that prefix).
+    lo = [bisect.bisect_left(paths, lic.prefix) for lic in licenses]
+    hi = [bisect.bisect_left(paths, lic.prefix + "2") for lic in licenses]
+
+    for i in range(n):
+        if not any(lo[j] <= i < hi[j] for j in range(m)):
+            raise ProofError(
+                f"变更键 {keys[i]}（按键路径升序第 {i + 1}/{n} 个）不在任何许可"
+                "的 0/1 前缀范围内，没有候选许可可承接",
+                "license_uncovered_key",
+            )
+
+    by_id = sorted(range(m), key=lambda j: (licenses[j].id, licenses[j].index))
+    by_lo = sorted(range(m), key=lambda j: (lo[j], licenses[j].index))
+    caps = [lic.quota for lic in licenses]
+
+    def max_seatable(start: int, budget: list[int]) -> int:
+        """Greedily seat keys start..n-1 on the earliest-expiring license.
+
+        Optimal for interval-convex bipartite matching (exchange argument);
+        consumes the caller-provided copy of `budget`.
+        """
+        heap: list[tuple[int, int]] = []
+        ptr = 0
+        seated = 0
+        for i in range(start, n):
+            while ptr < m and lo[by_lo[ptr]] <= i:
+                j = by_lo[ptr]
+                if budget[j] > 0 and hi[j] > i:
+                    heapq.heappush(heap, (hi[j], j))
+                ptr += 1
+            while heap and (heap[0][0] <= i or budget[heap[0][1]] <= 0):
+                heapq.heappop(heap)
+            if not heap:
+                return seated
+            budget[heap[0][1]] -= 1
+            seated += 1
+            if budget[heap[0][1]] == 0:
+                heapq.heappop(heap)
+        return seated
+
+    assignment = [-1] * n
+    for i in range(n):
+        for j in by_id:
+            if caps[j] <= 0 or not lo[j] <= i < hi[j]:
+                continue
+            caps[j] -= 1
+            if max_seatable(i + 1, caps[:]) == n - i - 1:
+                assignment[i] = j
+                break
+            caps[j] += 1
+        else:
+            best = max_seatable(0, [lic.quota for lic in licenses])
+            raise ProofError(
+                f"许可额度不足：容量约束最多承接 {best}/{n} 个变更键；按键路径"
+                f"升序第 {i + 1} 个键 {keys[i]} 起，剩余许可额度无法让全部键"
+                "各占用一次许可额度",
+                "license_capacity",
+            )
+    return assignment
+
+
+def _license_witness(
+    keys: list[str], licenses: list[License], assignment: list[int]
+) -> dict:
+    """Per-key hit prefix plus per-license used/unused quota."""
+    used = [0] * len(licenses)
+    for j in assignment:
+        used[j] += 1
+    return {
+        "assignments": [
+            {
+                "key": keys[i],
+                "license_id": licenses[j].id,
+                "matched_prefix": "0b" + licenses[j].prefix,
+            }
+            for i, j in enumerate(assignment)
+        ],
+        "licenses": [
+            {
+                "id": lic.id,
+                "prefix": "0b" + lic.prefix,
+                "quota": lic.quota,
+                "used": used[t],
+                "unused": lic.quota - used[t],
+            }
+            for t, lic in enumerate(licenses)
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -388,6 +586,18 @@ def verify_batch(payload: object) -> VerifyResult:
             raise mismatch("旧根", got_old, declared_old, "old_root_mismatch")
         raise mismatch("新根", got_new, declared_new, "new_root_mismatch")
 
+    # ---- Prefix licenses (optional) -------------------------------------- #
+    # Only now — with BOTH roots verified — are the change keys combined with
+    # their prefix-matching licenses into capacity constraints. Any license
+    # violation rejects the whole batch; no partial assignment survives.
+    licenses = _parse_licenses(payload.get("licenses"))
+    witness = None
+    if licenses:
+        ordered_keys = [u.key for u in updates]    # ascending path order
+        ordered_paths = [u.path for u in updates]
+        assignment = _assign_licenses(ordered_keys, ordered_paths, licenses)
+        witness = _license_witness(ordered_keys, licenses, assignment)
+
     return VerifyResult(
         old_root=declared_old.hex(),
         new_root=declared_new.hex(),
@@ -415,11 +625,12 @@ def verify_batch(payload: object) -> VerifyResult:
         merges=[vars(m) for m in merges],
         defaults_used=defaults_used,
         changed_keys=[u.key for u in updates],
+        license_witness=witness,
     )
 
 
 def result_dict(r: VerifyResult, verification_id: str) -> dict:
-    return {
+    out = {
         "ok": True,
         "verification_id": verification_id,
         "old_root": r.old_root,
@@ -436,6 +647,11 @@ def result_dict(r: VerifyResult, verification_id: str) -> dict:
             for h in range(DEPTH, -1, -1)
         ],
     }
+    # Absent licenses -> the response stays byte-compatible with the legacy
+    # verifier: no license fields are added at all.
+    if r.license_witness is not None:
+        out["license_witness"] = r.license_witness
+    return out
 
 
 # --------------------------------------------------------------------------- #

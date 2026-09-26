@@ -7,7 +7,8 @@
 #                             context, also run a real `docker build`.
 # Phase 2  CODE TESTS         unittest suite:
 #                             shared-prefix two-key change, tampered sibling
-#                             digest, extra proof node (+ all other rejects)
+#                             digest, extra proof node, prefix-license
+#                             assignment/rejections (+ all other rejects)
 # Phase 3  HTTP SMOKE         real HTTP against TARGET_URL (compose service
 #                             "web" when given, otherwise spawns a local server)
 #
@@ -58,7 +59,7 @@ fi
 green "PHASE 1 PASSED"
 
 # --------------------------------------------------------------------------- #
-hdr "PHASE 2/3: CODE TESTS (shared-prefix dual key / tampered sibling / extra node)"
+hdr "PHASE 2/3: CODE TESTS (shared-prefix dual key / tampered sibling / extra node / prefix licenses)"
 "$PY" -m unittest discover -s "$TEST_DIR" -p 'test_*.py' -v
 green "PHASE 2 PASSED"
 

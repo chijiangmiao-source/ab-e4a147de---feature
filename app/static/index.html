@@ -53,18 +53,32 @@
           placeholder='[&#10;  {"depth": 256, "prefix": "0b…256 bits…", "digest": "<64 hex>"}&#10;]'></textarea>
       </label>
 
+      <label>前缀许可（可选，JSON 数组；每项 {"id": 唯一许可标识, "prefix": "0b…0/1…", "quota": 可覆盖的最多变更键数}）
+        <textarea id="licenses" rows="5" spellcheck="false"
+          placeholder='[&#10;  {"id": "LINE-WIDE", "prefix": "0b0", "quota": 1}&#10;]'></textarea>
+      </label>
+      <p class="hint">
+        填写许可后，服务仍先完成旧/新根与共享证明的同步复算；双根有效后，才把每个变更键与其所有
+        前缀匹配许可组成容量约束——任一变更键无候选许可、或全部键无法各占用一次许可额度，整批拒绝。
+        嵌套/重叠许可不按输入顺序贪心分配，而是在全部可行分配中给出「键路径升序 × 许可标识字典序最小」
+        的唯一稳定见证，并返回逐键命中前缀与各许可的已用/未用额度。留空则保持原有核验请求与响应。
+        想观察拒绝：点「容量不足变体」载入后提交，真实 API 将返回 license_capacity。
+      </p>
+
       <details class="paste-all">
         <summary>也可以直接粘贴完整 JSON（展开后将整体解析填入）</summary>
         <textarea id="paste-all" rows="8" spellcheck="false"
-          placeholder='{"old_root": "...", "new_root": "...", "leaves": [...], "shared_siblings": [...]}'></textarea>
+          placeholder='{"old_root": "...", "new_root": "...", "leaves": [...], "shared_siblings": [...], "licenses": [...]}'></textarea>
         <button type="button" id="parse-all" class="btn btn-ghost">解析并填入上方字段</button>
       </details>
 
       <div class="actions">
         <button type="submit" class="btn btn-primary" id="submit-btn">提交核验（双树重建）</button>
         <button type="button" class="btn btn-ghost" id="demo-btn">载入共享前缀双键示例</button>
+        <button type="button" class="btn btn-ghost" id="demo-tight-btn">容量不足变体</button>
         <button type="button" class="btn btn-ghost" id="clear-btn">清空</button>
       </div>
+      <p class="formnote" id="form-note" hidden></p>
       <p class="formerror" id="form-error" hidden></p>
     </form>
   </section>

@@ -8,6 +8,11 @@ Checks against the REAL API:
                                               BOTH recomputed roots match
   4. tampered sibling digest               -> ok=false, old_root_mismatch
   5. extra proof node (off path)           -> ok=false, extra_proof_node
+  6. prefix licenses (demo set)            -> ok=true, stable lex-min witness,
+                                              wide license exhausted / narrow spare
+  7. insufficient total license capacity   -> ok=false, license_capacity
+  8. duplicate id / bad prefix / bad quota / uncovered key rejections
+  9. request without licenses              -> legacy response, no witness field
 
 Usage: http_smoke.py [base_url]   (default http://127.0.0.1:${PORT:-8080})
 Exits 0 only when every assertion holds.
@@ -130,6 +135,81 @@ def main() -> int:
         check("extra proof node REJECTED (extra_proof_node)",
               bad2.get("ok") is False and bad2["error"]["code"] == "extra_proof_node",
               json.dumps(bad2, ensure_ascii=False)[:300])
+
+        # ---- prefix licenses -------------------------------------------- #
+        check("demo payload carries nested/overlapping licenses",
+              isinstance(payload.get("licenses"), list)
+              and len(payload["licenses"]) >= 2)
+
+        if ok.get("ok") and "license_witness" in ok:
+            w = ok["license_witness"]
+            wkeys = [a["key"] for a in w["assignments"]]
+            check("license witness present on the accepted demo batch", True)
+            check("  witness ordered by ascending key path, one slot per key",
+                  wkeys == sorted(wkeys) and sorted(wkeys) == sorted(ok["changed_keys"]))
+            check("  per-license used + unused == quota",
+                  all(l["used"] + l["unused"] == l["quota"] for l in w["licenses"]))
+            quota = {l["id"]: l for l in w["licenses"]}
+            wide = quota.get("NEUTRON-LINE-WIDE")
+            narrow = quota.get("NEUTRON-A0-EXACT")
+            check("  wide license exhausted while narrow still available",
+                  wide is not None and wide["unused"] == 0
+                  and narrow is not None and narrow["unused"] >= 1)
+            again = post(base, "/api/verify", payload)
+            check("  witness stable across identical submissions",
+                  again.get("license_witness", {}).get("assignments")
+                  == w["assignments"])
+        else:
+            check("license witness present on the accepted demo batch", False,
+                  json.dumps(ok, ensure_ascii=False)[:400])
+
+        legacy = json.loads(json.dumps(payload))
+        legacy.pop("licenses", None)
+        lres = post(base, "/api/verify", legacy)
+        check("request without licenses keeps legacy response (no witness field)",
+              lres.get("ok") is True and "license_witness" not in lres,
+              json.dumps(lres, ensure_ascii=False)[:300])
+
+        tight = json.loads(json.dumps(payload))
+        widest = min(tight["licenses"], key=lambda l: len(l["prefix"]))
+        tight["licenses"] = [{**widest, "quota": 1}]
+        bad3 = post(base, "/api/verify", tight)
+        check("insufficient total capacity REJECTED (license_capacity)",
+              bad3.get("ok") is False and bad3["error"]["code"] == "license_capacity",
+              json.dumps(bad3, ensure_ascii=False)[:300])
+        check("  capacity rejection carries a fresh verification_id",
+              bad3.get("verification_id") not in (None, first_id))
+
+        dup = json.loads(json.dumps(payload))
+        dup["licenses"] = dup["licenses"] + [dict(dup["licenses"][0])]
+        bad4 = post(base, "/api/verify", dup)
+        check("duplicate license id REJECTED (duplicate_license_id)",
+              bad4.get("ok") is False
+              and bad4["error"]["code"] == "duplicate_license_id",
+              json.dumps(bad4, ensure_ascii=False)[:300])
+
+        badp = json.loads(json.dumps(payload))
+        badp["licenses"][0]["prefix"] = "0b012"
+        bad5 = post(base, "/api/verify", badp)
+        check("illegal license prefix REJECTED (license_prefix_format)",
+              bad5.get("ok") is False
+              and bad5["error"]["code"] == "license_prefix_format",
+              json.dumps(bad5, ensure_ascii=False)[:300])
+
+        badq = json.loads(json.dumps(payload))
+        badq["licenses"][0]["quota"] = 0
+        bad6 = post(base, "/api/verify", badq)
+        check("non-positive quota REJECTED (license_quota)",
+              bad6.get("ok") is False and bad6["error"]["code"] == "license_quota",
+              json.dumps(bad6, ensure_ascii=False)[:300])
+
+        unc = json.loads(json.dumps(payload))
+        unc["licenses"] = [{"id": "ELSEWHERE", "prefix": "0b1", "quota": 5}]
+        bad7 = post(base, "/api/verify", unc)
+        check("key without candidate license REJECTED (license_uncovered_key)",
+              bad7.get("ok") is False
+              and bad7["error"]["code"] == "license_uncovered_key",
+              json.dumps(bad7, ensure_ascii=False)[:300])
 
     finally:
         if proc is not None:

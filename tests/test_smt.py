@@ -7,6 +7,10 @@ Covers the demanded rejection classes:
   * missing non-default sibling
   * duplicate path / wrong path order / shared-ancestor conflict
   * independently wrong old vs new root
+  * prefix licenses: lexicographically-minimal stable witness (never
+    input-order greedy), wide-exhausted/narrow-available acceptance,
+    capacity/uncovered-key/duplicate-id/bad-prefix/bad-quota rejections,
+    and legacy compatibility when licenses are omitted
 """
 
 import os
@@ -20,9 +24,11 @@ from smt import (  # noqa: E402
     DEPTH,
     ProofError,
     build_tree,
+    key_to_path,
     leaf_hash,
     node_hash,
     proof_for_changes,
+    result_dict,
     verify_batch,
     sha256,
 )
@@ -267,6 +273,183 @@ class RejectionTests(unittest.TestCase):
         else:
             sibs[index]["digest"] = digest.hex()
         return {**self.payload, "shared_siblings": sibs}
+
+
+P255 = key_to_path(KEY_A0)[1][:255]  # the 255 leading bits KEY_A0/KEY_A1 share
+
+
+def lic(lid, prefix, quota):
+    return {"id": lid, "prefix": prefix, "quota": quota}
+
+
+class LicenseTests(unittest.TestCase):
+    """Prefix-permit capacity constraints, evaluated only after both roots
+    verify. Keys under test: KEY_A0 < KEY_A1 (share the 255-bit P255)."""
+
+    def setUp(self):
+        self.old = {KEY_A0: v(b"A@1"), KEY_A1: v(b"B@1")}
+        self.payload = make_change(
+            self.old, {KEY_A0: v(b"A@2"), KEY_A1: v(b"B@2")}, [KEY_A0, KEY_A1]
+        )
+
+    def with_licenses(self, licenses):
+        return {**self.payload, "licenses": licenses}
+
+    def assertReject(self, payload, code):
+        with self.assertRaises(ProofError) as cm:
+            verify_batch(payload)
+        self.assertEqual(cm.exception.code, code, cm.exception.message)
+        return cm.exception
+
+    def witness(self, payload):
+        r = verify_batch(payload)
+        self.assertIsNotNone(r.license_witness)
+        return r.license_witness
+
+    # -- acceptance -------------------------------------------------------- #
+    def test_overlapping_licenses_stable_assignment(self):
+        licenses = [
+            lic("WIDE", "0b0", 1),
+            lic("PAIR", "0b" + P255, 1),
+            lic("EXACT-A0", "0b" + P255 + "0", 2),
+        ]
+        w = self.witness(self.with_licenses(licenses))
+        # KEY_A0 takes the smallest id that keeps the rest feasible; KEY_A1
+        # then takes PAIR (smaller than WIDE).
+        self.assertEqual(
+            [(a["key"], a["license_id"]) for a in w["assignments"]],
+            [(KEY_A0, "EXACT-A0"), (KEY_A1, "PAIR")],
+        )
+        self.assertEqual(w["assignments"][0]["matched_prefix"], "0b" + P255 + "0")
+        self.assertEqual(w["assignments"][1]["matched_prefix"], "0b" + P255)
+        quota = {l["id"]: l for l in w["licenses"]}
+        self.assertEqual((quota["WIDE"]["used"], quota["WIDE"]["unused"]), (0, 1))
+        self.assertEqual((quota["PAIR"]["used"], quota["PAIR"]["unused"]), (1, 0))
+        self.assertEqual(
+            (quota["EXACT-A0"]["used"], quota["EXACT-A0"]["unused"]), (1, 1)
+        )
+        # Stable: re-submitting the identical batch yields the same witness.
+        w2 = self.witness(self.with_licenses(licenses))
+        self.assertEqual(w, w2)
+
+    def test_input_order_greedy_would_fail_but_assignment_exists(self):
+        # Listed widest-first: per-key input-order greedy seats KEY_A0 on WIDE
+        # and then has nothing for KEY_A1. The verifier must NOT do that.
+        licenses = [lic("WIDE", "0b0", 1), lic("EXACT-A0", "0b" + P255 + "0", 1)]
+        w = self.witness(self.with_licenses(licenses))
+        self.assertEqual(
+            [a["license_id"] for a in w["assignments"]], ["EXACT-A0", "WIDE"]
+        )
+
+    def test_lexicographically_smallest_witness_chosen(self):
+        # Both licenses cover both keys; id "AAA" must saturate first.
+        licenses = [lic("BBB", "0b0", 2), lic("AAA", "0b" + P255, 2)]
+        w = self.witness(self.with_licenses(licenses))
+        self.assertEqual(
+            [a["license_id"] for a in w["assignments"]], ["AAA", "AAA"]
+        )
+        # Same shape, but "AAA" has only one slot -> KEY_A1 falls back to BBB.
+        licenses = [lic("BBB", "0b" + P255, 2), lic("AAA", "0b0", 1)]
+        w = self.witness(self.with_licenses(licenses))
+        self.assertEqual(
+            [a["license_id"] for a in w["assignments"]], ["AAA", "BBB"]
+        )
+
+    def test_wide_exhausted_narrow_available_still_passes(self):
+        # The demo scenario: the wide license ends exhausted while the narrow
+        # one keeps spare quota — the batch is accepted.
+        licenses = [
+            lic("NEUTRON-LINE-WIDE", "0b0", 1),
+            lic("NEUTRON-PAIR-255", "0b" + P255, 1),
+            lic("NEUTRON-A0-EXACT", "0b" + P255 + "0", 2),
+        ]
+        w = self.witness(self.with_licenses(licenses))
+        self.assertEqual(
+            [a["license_id"] for a in w["assignments"]],
+            ["NEUTRON-A0-EXACT", "NEUTRON-LINE-WIDE"],
+        )
+        quota = {l["id"]: l for l in w["licenses"]}
+        self.assertEqual(quota["NEUTRON-LINE-WIDE"]["unused"], 0)   # wide exhausted
+        self.assertEqual(quota["NEUTRON-A0-EXACT"]["unused"], 1)    # narrow spare
+        self.assertEqual(quota["NEUTRON-PAIR-255"]["used"], 0)
+
+    def test_empty_prefix_license_matches_everything(self):
+        licenses = [lic("ROOT", "0b", 2)]
+        w = self.witness(self.with_licenses(licenses))
+        self.assertEqual([a["license_id"] for a in w["assignments"]], ["ROOT", "ROOT"])
+        self.assertEqual(w["licenses"][0]["used"], 2)
+
+    def test_witness_present_in_result_dict(self):
+        r = verify_batch(self.with_licenses([lic("ROOT", "0b", 2)]))
+        d = result_dict(r, "vid")
+        self.assertIn("license_witness", d)
+        self.assertEqual(len(d["license_witness"]["assignments"]), 2)
+
+    # -- rejection ---------------------------------------------------------- #
+    def test_total_capacity_insufficient_rejected(self):
+        err = self.assertReject(self.with_licenses([lic("WIDE", "0b0", 1)]),
+                                "license_capacity")
+        self.assertIn("1/2", err.message)  # at most 1 of 2 keys can be seated
+
+    def test_both_slots_on_one_key_leave_other_uncovered(self):
+        # Two slots for two keys, but both licenses only cover KEY_A0.
+        licenses = [
+            lic("A0-ONE", "0b" + P255 + "0", 1),
+            lic("A0-TWO", "0b" + P255 + "0", 1),
+        ]
+        self.assertReject(self.with_licenses(licenses), "license_uncovered_key")
+
+    def test_uncovered_key_located(self):
+        err = self.assertReject(
+            self.with_licenses([lic("ONLY-A0", "0b" + P255 + "0", 5)]),
+            "license_uncovered_key",
+        )
+        self.assertIn(KEY_A1, err.message)
+
+    def test_duplicate_license_id_rejected(self):
+        licenses = [lic("DUP", "0b0", 1), lic("DUP", "0b1", 2)]
+        err = self.assertReject(self.with_licenses(licenses), "duplicate_license_id")
+        self.assertIn("licenses[0]", err.message)
+        self.assertIn("licenses[1]", err.message)
+
+    def test_bad_prefix_rejected(self):
+        for bad in ("0b012", "0b" + "0" * 257, "0x10", 5, ["0"]):
+            self.assertReject(
+                self.with_licenses([lic("L", bad, 1)]), "license_prefix_format"
+            )
+
+    def test_non_positive_quota_rejected(self):
+        for bad in (0, -1, "1", 1.5, True, None):
+            self.assertReject(
+                self.with_licenses([lic("L", "0b0", bad)]), "license_quota"
+            )
+
+    def test_license_structure_rejected(self):
+        self.assertReject(self.with_licenses("not-a-list"), "license_format")
+        self.assertReject(self.with_licenses([["id"]]), "license_format")
+        self.assertReject(
+            self.with_licenses([{"id": "L", "prefix": "0b0"}]), "license_format"
+        )
+        self.assertReject(
+            self.with_licenses([lic("  ", "0b0", 1)]), "license_id_format"
+        )
+
+    def test_roots_verified_before_licenses(self):
+        # A broken root must surface even when the licenses are also invalid:
+        # the dual-root recomputation always runs first.
+        p = self.with_licenses([lic("DUP", "0b0", 1), lic("DUP", "0b1", 1)])
+        p["old_root"] = "00" * 32
+        self.assertReject(p, "old_root_mismatch")
+
+    # -- compatibility ------------------------------------------------------ #
+    def test_omitted_licenses_keep_legacy_behaviour(self):
+        for variant in ({}, {"licenses": None}, {"licenses": []}):
+            payload = {**self.payload, **variant}
+            r = verify_batch(payload)
+            self.assertIsNone(r.license_witness)
+            d = result_dict(r, "vid")
+            self.assertNotIn("license_witness", d)
+            self.assertEqual(d["changed_keys"], [KEY_A0, KEY_A1])
 
 
 class TraceStructureTests(unittest.TestCase):
