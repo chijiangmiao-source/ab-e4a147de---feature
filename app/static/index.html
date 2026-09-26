@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>稀疏 Merkle 根 · 批量配置变更核验</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⌬</span>
+    <div>
+      <h1>中子源设备配置登记册</h1>
+      <p>稀疏 Merkle 树（256 位键路径）批量改动独立复核</p>
+    </div>
+  </div>
+  <div class="topmeta">
+    <span id="health-dot" class="dot dot-unknown" title="健康检查"></span>
+    <span id="health-text">健康检查中…</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1. 粘贴批量改动证明</h2>
+    <p class="hint">
+      叶节点 = <code>SHA-256(00 ‖ 叶摘要)</code>，内部节点 =
+      <code>SHA-256(01 ‖ 左摘要 ‖ 右摘要)</code>。叶必须严格按 256 位键路径升序排列；
+      共享兄弟节点以 <code>depth</code>（节点层级 1..256）与 <code>prefix</code>
+      （该层级等长 0/1 前缀）定位。服务会同时自底向上重建旧树与新树，不采信提交方摘要。
+    </p>
+
+    <form id="verify-form">
+      <div class="grid2">
+        <label>旧根 old_root
+          <input id="old-root" name="old_root" spellcheck="false" autocomplete="off"
+            placeholder="64 位十六进制，共 256 bit" />
+        </label>
+        <label>新根 new_root
+          <input id="new-root" name="new_root" spellcheck="false" autocomplete="off"
+            placeholder="64 位十六进制，共 256 bit" />
+        </label>
+      </div>
+
+      <label>旧叶 → 新叶（按键路径升序的 JSON 数组）
+        <textarea id="leaves" rows="7" spellcheck="false"
+          placeholder='[&#10;  {"key": "<64 hex>", "old_leaf": "<64 hex>", "new_leaf": "<64 hex>"}&#10;]'></textarea>
+      </label>
+
+      <label>共享兄弟节点证明（depth + prefix 定位，JSON 数组；默认空子树无需提供）
+        <textarea id="siblings" rows="7" spellcheck="false"
+          placeholder='[&#10;  {"depth": 256, "prefix": "0b…256 bits…", "digest": "<64 hex>"}&#10;]'></textarea>
+      </label>
+
+      <details class="paste-all">
+        <summary>也可以直接粘贴完整 JSON（展开后将整体解析填入）</summary>
+        <textarea id="paste-all" rows="8" spellcheck="false"
+          placeholder='{"old_root": "...", "new_root": "...", "leaves": [...], "shared_siblings": [...]}'></textarea>
+        <button type="button" id="parse-all" class="btn btn-ghost">解析并填入上方字段</button>
+      </details>
+
+      <div class="actions">
+        <button type="submit" class="btn btn-primary" id="submit-btn">提交核验（双树重建）</button>
+        <button type="button" class="btn btn-ghost" id="demo-btn">载入共享前缀双键示例</button>
+        <button type="button" class="btn btn-ghost" id="clear-btn">清空</button>
+      </div>
+      <p class="formerror" id="form-error" hidden></p>
+    </form>
+  </section>
+
+  <section id="result-panel" class="card" aria-live="polite">
+    <h2>2. 核验结果</h2>
+    <div id="result-empty" class="placeholder">尚未提交。每次提交都会清空此处，只显示本次请求（编号 <code>verification_id</code>）的真实 API 结论。</div>
+    <div id="result-body" hidden></div>
+  </section>
+</main>
+
+<footer>
+  <span>叶 SHA-256(00‖x) · 内部 SHA-256(01‖L‖R) · 深度 256 · 无状态 API <code>POST /api/verify</code></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+services:
+  web:
+    build: .
+    image: smt-verifier:latest
+    environment:
+      # Internal listen port is fixed; host-side mapping is configurable.
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    ports:
+      # Host port is configurable: APP_PORT=9090 docker compose up
+      - "${APP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    restart: unless-stopped
+
+  # One-shot acceptance: image build check + code tests (shared-prefix two-key
+  # change, tampered sibling digest, extra proof node) + HTTP smoke against the
+  # real web API. Exits 0 on pass, nonzero on failure; does not stay running.
+  verify:
+    build: .
+    image: smt-verifier:latest
+    command: ["bash", "/app/tests/run_verify.sh", "http://web:8080"]
+    environment:
+      TARGET_URL: "http://web:8080"
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: "no"
